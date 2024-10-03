@@ -35,14 +35,34 @@ def query_transaction_manager(order_number):
     conn.close()
     return df
 
-# Function to display DataFrame as HTML table in Streamlit
+# Function to display DataFrame as compact HTML table in Streamlit
 def display_html_table(df, title):
     st.markdown(f"### {title}")
+
     if df.empty:
         st.markdown(f"**No data found for {title}**")
     else:
-        # Convert the DataFrame to an HTML table and display in Streamlit
-        st.markdown(df.to_html(index=False, justify='center', border=1), unsafe_allow_html=True)
+        # Define compact CSS styles
+        compact_css = """
+        <style>
+        table {
+            border-collapse: collapse;
+            width: 100%;
+            font-size: 12px;
+        }
+        th, td {
+            padding: 4px;
+            text-align: left;
+            border: 1px solid #dddddd;
+        }
+        th {
+            background-color: #f2f2f2;
+        }
+        </style>
+        """
+
+        # Convert DataFrame to an HTML table and apply compact CSS
+        st.markdown(compact_css + df.to_html(index=False, justify='left', border=1), unsafe_allow_html=True)
 
 # Streamlit app logic
 st.title("Order Number Ticket Analyzer")
