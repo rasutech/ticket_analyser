@@ -1,0 +1,122 @@
+import streamlit as st
+import pandas as pd
+import psycopg2
+from datetime import datetime
+import requests
+
+# Function to connect to PostgreSQL
+def get_pg_connection():
+    return psycopg2.connect(
+        host="your_host",
+        database="your_db",
+        user="your_user",
+        password="your_password"
+    )
+
+# Function to query t_raw_order
+def query_raw_order(order_number):
+    conn = get_pg_connection()
+    query = f"SELECT * FROM t_raw_order WHERE work_order_number = '{order_number}'"
+    df = pd.read_sql(query, conn)
+    conn.close()
+    return df
+
+# Function to query t_master_order
+def query_master_order(order_number):
+    conn = get_pg_connection()
+    query = f"SELECT * FROM t_master_order WHERE order_number = '{order_number}'"
+    df = pd.read_sql(query, conn)
+    conn.close()
+    return df
+
+# Function to query t_transaction_manager
+def query_transaction_manager(order_number):
+    conn = get_pg_connection()
+    query = f"SELECT * FROM t_transaction_manager WHERE order_number = '{order_number}'"
+    df = pd.read_sql(query, conn)
+    conn.close()
+    return df
+
+# Function to fetch logs from ELK
+def fetch_logs_from_elk(start_time, end_time, work_step_identifier):
+    elk_url = f"https://your_elk_url/logs"
+    params = {
+        "start_time": start_time,
+        "end_time": end_time,
+        "query": f"ApplicationId:ES0v AND work_step_identifier:{work_step_identifier}"
+    }
+    response = requests.get(elk_url, params=params)
+    if response.status_code == 200:
+        return response.text
+    return "No logs found or error fetching logs."
+
+# Function to process the analysis
+def process_order(order_number):
+    analysis = []
+
+    # Step 1: Query t_raw_order
+    st.write(f"Processing t_raw_order for order: {order_number}...")
+    raw_order_df = query_raw_order(order_number)
+    if raw_order_df.empty:
+        analysis.append(f"t_raw_order has no information for order_number {order_number}")
+    else:
+        analysis.append(f"ORDER_SOURCE: {raw_order_df['ORDER_SOURCE'][0]}, ORDER_ACTION: {raw_order_df['ORDER_ACTION'][0]}")
+    
+    # Step 2: Query t_master_order
+    st.write(f"Processing t_master_order for order: {order_number}...")
+    master_order_df = query_master_order(order_number)
+    if master_order_df.empty:
+        analysis.append(f"t_master_order has no matching Order_number {order_number}")
+    else:
+        order_status = master_order_df['STATUS'][0]
+        analysis.append(f"LOB: {master_order_df['LOB'][0]}, STATUS: {order_status}, ORDER_TYPE: {master_order_df['ORDER_TYPE'][0]}")
+    
+    # Step 3: Query t_transaction_manager
+    st.write(f"Processing t_transaction_manager for order: {order_number}...")
+    transaction_manager_df = query_transaction_manager(order_number)
+    if not transaction_manager_df.empty:
+        for index, row in transaction_manager_df.iterrows():
+            analysis.append(f"Work Step: {row['work_step_name']}, Status: {row['state']}, Start Time: {row['start_time']}, End Time: {row['end_time']}")
+    
+        # Step 4: Check if all work steps are SUCCESS and status is WO_COMPLETE
+        all_success = all(transaction_manager_df['state'] == 'SUCCESS')
+        if all_success and order_status == 'WO_COMPLETE':
+            analysis.append("Order marked as Completed.")
+        else:
+            # Find the failed step
+            failed_steps = transaction_manager_df[transaction_manager_df['state'] != 'SUCCESS']
+            if not failed_steps.empty:
+                st.write("Fetching logs for failed work step...")
+                latest_failed_step = failed_steps.iloc[-1]
+                logs = fetch_logs_from_elk(latest_failed_step['start_time'], latest_failed_step['end_time'], latest_failed_step['work_step_identifier'])
+                analysis.append(f"Latest Failed Step: {latest_failed_step['work_step_name']}, Logs: {logs}")
+    
+    return analysis
+
+# Streamlit app logic
+st.title("Order Number Ticket Analyzer")
+
+order_number = st.text_input("Enter Order Number")
+submit_button = st.button("Submit")
+
+# Initialize session state to store analysis results
+if 'analysis_results' not in st.session_state:
+    st.session_state['analysis_results'] = []
+
+# When the submit button is clicked
+if submit_button:
+    if order_number:
+        # Clear previous results
+        st.session_state['analysis_results'] = []
+        
+        # Process the order and append results
+        analysis = process_order(order_number)
+        st.session_state['analysis_results'].extend(analysis)
+
+        # Display results
+        for result in st.session_state['analysis_results']:
+            st.write(result)
+    
+    else:
+        st.error("Please enter a valid Order Number.")
+
