@@ -1,0 +1,10 @@
+{
+  "scripts": {
+    "ng": "ng",
+    "start": "ng serve",
+    "build": "ng build --base-href=/crazy/",
+    "build:prod": "ng build --configuration=production --base-href=/crazy/",
+    "watch": "ng build --watch --configuration development",
+    "test": "ng test"
+  }
+}
