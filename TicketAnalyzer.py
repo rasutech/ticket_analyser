@@ -6,21 +6,28 @@ from datetime import datetime
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.cluster import KMeans, DBSCAN
-from sklearn.decomposition import PCA
-from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.decomposition import PCA, TruncatedSVD
+from sklearn.feature_extraction.text import TfidfVectorizer, CountVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import StandardScaler, normalize
+from sklearn.manifold import TSNE
 import nltk
 from nltk.corpus import stopwords
 from nltk.stem import WordNetLemmatizer
 from nltk.tokenize import word_tokenize
+import gensim
+from gensim.models import CoherenceModel, LdaModel
+from gensim.corpora import Dictionary
+import pyLDAvis
+import pyLDAvis.gensim_models
 import re
-import transformers
-from transformers import AutoTokenizer, AutoModel
-import torch
-from collections import Counter
-import warnings
 import os
+import torch
+from transformers import AutoTokenizer, AutoModel, pipeline
+from collections import Counter, defaultdict
+import warnings
+from wordcloud import WordCloud
+import matplotlib.colors as mcolors
 warnings.filterwarnings('ignore')
 
 # Download required NLTK resources
@@ -31,36 +38,53 @@ nltk.download('wordnet')
 
 class TicketAnalyzer:
     """
-    A class for analyzing service desk tickets using NLP techniques.
-    Performs ticket similarity analysis and root cause classification.
+    A class for analyzing service desk tickets using advanced NLP techniques.
+    Performs ticket similarity analysis, root cause classification, and topic modeling.
     """
     
-    def __init__(self, db_config, model_path=None):
+    def __init__(self, db_config, model_path=None, model_name="roberta-base"):
         """
         Initialize with database configuration and optional local model path.
         
         Args:
             db_config (dict): Database configuration parameters
-            model_path (str, optional): Path to locally saved BERT model
+            model_path (str, optional): Path to locally saved transformer model
+            model_name (str): Name of the transformer model to use
+                              (e.g., "bert-base-uncased", "roberta-base", "roberta-large")
         """
         self.db_config = db_config
-        # Initialize BERT model and tokenizer from local path if provided
+        self.model_name = model_name
+        
+        # Initialize transformer model and tokenizer from local path if provided
         if model_path:
-            print(f"Loading BERT model from local path: {model_path}")
+            print(f"Loading transformer model from local path: {model_path}")
             self.tokenizer = AutoTokenizer.from_pretrained(model_path)
             self.model = AutoModel.from_pretrained(model_path)
         else:
             # Try to download from Hugging Face (may fail behind VPN)
             try:
-                self.tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
-                self.model = AutoModel.from_pretrained('bert-base-uncased')
+                print(f"Loading transformer model: {model_name}")
+                self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+                self.model = AutoModel.from_pretrained(model_name)
             except Exception as e:
-                print(f"Error downloading BERT model: {e}")
+                print(f"Error downloading transformer model: {e}")
                 print("Please provide a local model path using the model_path parameter.")
                 raise
         
+        # Initialize NLP components
         self.lemmatizer = WordNetLemmatizer()
         self.stop_words = set(stopwords.words('english'))
+        
+        # Add IT/technical specific stop words
+        self.tech_stop_words = {
+            'please', 'help', 'issue', 'problem', 'error', 'ticket', 'request',
+            'user', 'server', 'system', 'application', 'app', 'service', 'support',
+            'hi', 'hello', 'thanks', 'thank', 'regards', 'dear', 'team',
+            'incident', 'following', 'needed', 'need', 'requires', 'required',
+            'get', 'getting', 'got', 'using', 'used', 'use', 'see', 'seen',
+            'facing', 'faced', 'experiencing', 'experienced'
+        }
+        self.stop_words.update(self.tech_stop_words)
         
     def connect_to_db(self):
         """
@@ -158,18 +182,44 @@ class TicketAnalyzer:
         
         return ' '.join(processed_tokens)
     
-    def get_bert_embeddings(self, texts):
+    def preprocess_for_topic_modeling(self, texts):
         """
-        Generate BERT embeddings for a list of texts.
+        Preprocess a list of texts specifically for topic modeling.
+        
+        Args:
+            texts (list): List of text strings
+            
+        Returns:
+            list: List of tokenized documents
+            gensim.corpora.Dictionary: Dictionary mapping words to IDs
+        """
+        # Preprocess each text
+        processed_texts = [self.preprocess_text(text) for text in texts]
+        
+        # Tokenize
+        tokenized_texts = [text.split() for text in processed_texts]
+        
+        # Create dictionary
+        dictionary = Dictionary(tokenized_texts)
+        
+        # Filter out extremes (words that appear in less than 5 documents or more than 50% of documents)
+        dictionary.filter_extremes(no_below=5, no_above=0.5)
+        
+        return tokenized_texts, dictionary
+    
+    def get_transformer_embeddings(self, texts, batch_size=16, max_length=512):
+        """
+        Generate embeddings for a list of texts using the transformer model.
         
         Args:
             texts (list): List of preprocessed text strings
+            batch_size (int): Number of texts to process at once
+            max_length (int): Maximum token length for the model
             
         Returns:
-            numpy.ndarray: BERT embeddings matrix
+            numpy.ndarray: Transformer embeddings matrix
         """
         embeddings = []
-        batch_size = 16  # Process texts in batches to avoid OOM errors
         
         for i in range(0, len(texts), batch_size):
             batch_texts = texts[i:i+batch_size]
@@ -179,15 +229,16 @@ class TicketAnalyzer:
                 batch_texts, 
                 padding=True,
                 truncation=True,
-                max_length=512,
+                max_length=max_length,
                 return_tensors='pt'
             )
             
-            # Generate BERT embeddings (no gradient calculation needed)
+            # Generate embeddings (no gradient calculation needed)
             with torch.no_grad():
                 model_output = self.model(**encoded_input)
                 
             # Use CLS token embedding (first token) as sentence embedding
+            # For RoBERTa models, still use the first token which serves a similar purpose
             batch_embeddings = model_output.last_hidden_state[:, 0, :].numpy()
             embeddings.extend(batch_embeddings)
             
@@ -197,7 +248,7 @@ class TicketAnalyzer:
     
     def perform_similarity_analysis(self, df):
         """
-        Perform similarity analysis on ticket descriptions using BERT embeddings.
+        Perform similarity analysis on ticket descriptions using transformer embeddings.
         
         Args:
             df (pandas.DataFrame): DataFrame containing ticket data
@@ -230,8 +281,8 @@ class TicketAnalyzer:
                 
             texts = code_df['processed_description'].tolist()
             
-            # Get BERT embeddings
-            embeddings = self.get_bert_embeddings(texts)
+            # Get transformer embeddings
+            embeddings = self.get_transformer_embeddings(texts)
             
             # Calculate similarity matrix
             similarity_matrix = cosine_similarity(embeddings)
@@ -248,6 +299,220 @@ class TicketAnalyzer:
                 }
                 
         return similarity_results, pca_results
+    
+    def perform_topic_modeling(self, df, min_tickets=100):
+        """
+        Perform topic modeling on ticket descriptions grouped by assignment group.
+        Only analyzes groups with at least min_tickets.
+        
+        Args:
+            df (pandas.DataFrame): DataFrame containing ticket data
+            min_tickets (int): Minimum number of tickets required for topic modeling
+            
+        Returns:
+            dict: Dictionary with assignment groups as keys and topic modeling results as values
+        """
+        # Preprocess descriptions if not already done
+        if 'processed_description' not in df.columns:
+            df['processed_description'] = df['description'].apply(self.preprocess_text)
+        
+        # Group by assignment_group
+        topic_results = {}
+        
+        # Get assignment groups with enough tickets
+        group_counts = df['assignment_group'].value_counts()
+        eligible_groups = group_counts[group_counts >= min_tickets].index.tolist()
+        
+        print(f"\nPerforming topic modeling for {len(eligible_groups)} assignment groups with {min_tickets}+ tickets")
+        
+        for group in eligible_groups:
+            print(f"\nAnalyzing topics for assignment group: {group}")
+            group_df = df[df['assignment_group'] == group].copy()
+            
+            # Skip if no data after filtering
+            if len(group_df) < min_tickets:
+                continue
+                
+            # Get processed descriptions
+            texts = group_df['processed_description'].tolist()
+            
+            # Preprocess for topic modeling
+            tokenized_texts, dictionary = self.preprocess_for_topic_modeling(texts)
+            
+            # Create corpus (bag of words)
+            corpus = [dictionary.doc2bow(text) for text in tokenized_texts]
+            
+            # Get optimal number of topics
+            coherence_scores = []
+            models = {}
+            
+            # Try different numbers of topics (range depends on dataset size)
+            max_topics = min(20, len(texts) // 10)  # Upper bound based on dataset size
+            topic_range = range(2, max_topics + 1, 2)  # Step by 2 for efficiency
+            
+            for num_topics in topic_range:
+                print(f"  Training LDA model with {num_topics} topics...")
+                lda_model = LdaModel(
+                    corpus=corpus,
+                    id2word=dictionary,
+                    num_topics=num_topics,
+                    random_state=42,
+                    passes=10,
+                    alpha='auto',
+                    per_word_topics=True
+                )
+                
+                models[num_topics] = lda_model
+                
+                # Calculate coherence score
+                coherence_model = CoherenceModel(
+                    model=lda_model,
+                    texts=tokenized_texts,
+                    dictionary=dictionary,
+                    coherence='c_v'
+                )
+                coherence_score = coherence_model.get_coherence()
+                coherence_scores.append((num_topics, coherence_score))
+                print(f"  Coherence score for {num_topics} topics: {coherence_score:.4f}")
+            
+            # Find optimal number of topics (highest coherence score)
+            optimal_num_topics, best_coherence = max(coherence_scores, key=lambda x: x[1])
+            print(f"Optimal number of topics for {group}: {optimal_num_topics} (coherence: {best_coherence:.4f})")
+            
+            # Get the best model
+            best_model = models[optimal_num_topics]
+            
+            # Extract topics and their keywords
+            topics = {}
+            for topic_id in range(optimal_num_topics):
+                # Get most significant words for this topic
+                topic_words = best_model.show_topic(topic_id, topn=15)
+                topics[topic_id] = {
+                    'words': topic_words,
+                    'name': self._generate_topic_name(topic_words)
+                }
+            
+            # Assign topics to tickets
+            topic_assignments = []
+            for i, doc_bow in enumerate(corpus):
+                # Get topic distribution for this document
+                topic_dist = best_model.get_document_topics(doc_bow)
+                # Find the dominant topic
+                dominant_topic = max(topic_dist, key=lambda x: x[1]) if topic_dist else (0, 0)
+                topic_assignments.append({
+                    'incident_number': group_df.iloc[i]['incident_number'],
+                    'topic_id': dominant_topic[0],
+                    'topic_probability': dominant_topic[1]
+                })
+            
+            # Create a DataFrame with topic assignments
+            topic_df = pd.DataFrame(topic_assignments)
+            
+            # Generate LDAvis visualization data
+            try:
+                vis_data = pyLDAvis.gensim_models.prepare(
+                    best_model, corpus, dictionary, sort_topics=False
+                )
+                # Save visualization data
+                output_dir = f"ticket_analysis_visualizations/topics_{group.replace(' ', '_')}"
+                os.makedirs(output_dir, exist_ok=True)
+                pyLDAvis.save_html(vis_data, f"{output_dir}/ldavis.html")
+            except Exception as e:
+                print(f"Error generating LDAvis visualization: {e}")
+                vis_data = None
+            
+            # Store results for this group
+            topic_results[group] = {
+                'model': best_model,
+                'dictionary': dictionary,
+                'corpus': corpus,
+                'topics': topics,
+                'optimal_num_topics': optimal_num_topics,
+                'coherence_score': best_coherence,
+                'topic_assignments': topic_df,
+                'vis_data': vis_data
+            }
+            
+            # Generate and save topic word clouds
+            self._generate_topic_wordclouds(topics, group)
+            
+        return topic_results
+            
+    def _generate_topic_name(self, topic_words, max_words=3):
+        """
+        Generate a human-readable name for a topic based on its most significant words.
+        
+        Args:
+            topic_words (list): List of (word, probability) tuples
+            max_words (int): Maximum number of words to include in the name
+            
+        Returns:
+            str: Human-readable topic name
+        """
+        # Extract words and their probabilities
+        words = [word for word, _ in topic_words[:max_words]]
+        
+        # Common IT-related categories for pattern matching
+        categories = {
+            'login': ['login', 'password', 'credential', 'authentication', 'access'],
+            'network': ['network', 'connection', 'internet', 'wifi', 'vpn', 'disconnect'],
+            'hardware': ['hardware', 'device', 'printer', 'scanner', 'keyboard', 'mouse'],
+            'software': ['software', 'install', 'update', 'upgrade', 'version'],
+            'email': ['email', 'outlook', 'mail', 'message', 'inbox'],
+            'database': ['database', 'sql', 'query', 'record', 'data'],
+            'error': ['error', 'exception', 'crash', 'failure', 'failed'],
+            'performance': ['slow', 'performance', 'speed', 'lag', 'latency'],
+            'security': ['security', 'firewall', 'block', 'permission', 'deny']
+        }
+        
+        # Check if any of the top words match a category
+        for category, patterns in categories.items():
+            if any(word in patterns for word in words):
+                return f"{category.title()}: {' '.join(words)}"
+        
+        # If no category match, just use the top words
+        return f"Topic: {' '.join(words)}"
+    
+    def _generate_topic_wordclouds(self, topics, group_name):
+        """
+        Generate word cloud visualizations for each topic.
+        
+        Args:
+            topics (dict): Dictionary of topics with their words
+            group_name (str): Name of the assignment group
+        """
+        # Create directory for word clouds
+        safe_group_name = re.sub(r'[^\w\-_]', '_', str(group_name))
+        output_dir = f"ticket_analysis_visualizations/topics_{safe_group_name}"
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Define a color map for the word clouds
+        colors = [color for name, color in mcolors.TABLEAU_COLORS.items()]
+        
+        # Generate a word cloud for each topic
+        for topic_id, topic_info in topics.items():
+            # Create a dictionary of word: weight
+            word_weights = {word: weight for word, weight in topic_info['words']}
+            
+            # Generate the word cloud
+            wc = WordCloud(
+                background_color='white',
+                max_words=100,
+                width=800,
+                height=400,
+                contour_width=3,
+                contour_color='steelblue',
+                color_func=lambda *args, **kwargs: colors[topic_id % len(colors)]
+            ).generate_from_frequencies(word_weights)
+            
+            # Plot and save
+            plt.figure(figsize=(10, 6))
+            plt.imshow(wc, interpolation='bilinear')
+            plt.axis('off')
+            plt.title(f"Topic {topic_id}: {topic_info['name']}")
+            plt.tight_layout()
+            plt.savefig(f"{output_dir}/topic_{topic_id}_wordcloud.png")
+            plt.close()
     
     def classify_root_causes(self, df):
         """
@@ -284,8 +549,8 @@ class TicketAnalyzer:
                 
             texts = group_df['processed_description'].tolist()
             
-            # Get BERT embeddings
-            embeddings = self.get_bert_embeddings(texts)
+            # Get transformer embeddings
+            embeddings = self.get_transformer_embeddings(texts)
             
             # Apply clustering - try both K-means and DBSCAN
             # First determine optimal K for K-means using elbow method
@@ -347,16 +612,36 @@ class TicketAnalyzer:
                 
                 # Extract top terms for this cluster
                 if cluster_texts:
+                    # Use zero-shot classification for root cause identification if we have a large cluster
+                    if len(cluster_texts) >= 10:
+                        # Try to identify root cause using transformer-based approach
+                        try:
+                            combined_text = " ".join(cluster_texts[:5])  # Use a sample of texts
+                            root_cause = self._identify_root_cause(combined_text)
+                        except Exception as e:
+                            print(f"Error in root cause identification: {e}")
+                            root_cause = None
+                    else:
+                        root_cause = None
+                    
+                    # Traditional word frequency approach
                     combined_text = " ".join(cluster_texts)
                     words = combined_text.split()
                     word_counts = Counter(words)
                     top_terms = [word for word, count in word_counts.most_common(5)]
                     
-                    root_causes[cluster_name] = {
+                    # Create cluster info
+                    cluster_info = {
                         'count': len(cluster_indices),
                         'top_terms': top_terms,
                         'sample_tickets': [group_df.iloc[i]['incident_number'] for i in cluster_indices[:3]]
                     }
+                    
+                    # Add root cause if available
+                    if root_cause:
+                        cluster_info['identified_root_cause'] = root_cause
+                    
+                    root_causes[cluster_name] = cluster_info
             
             # Store summary for this group
             root_cause_summary[group_key] = {
@@ -377,6 +662,46 @@ class TicketAnalyzer:
             df.loc[idx, 'group_key'] = cluster_info['group_key']
             
         return df, root_cause_summary
+    
+    def _identify_root_cause(self, text):
+        """
+        Use zero-shot classification to identify the root cause category.
+        
+        Args:
+            text (str): Combined text from cluster
+            
+        Returns:
+            str: Identified root cause category
+        """
+        try:
+            # Create a zero-shot classification pipeline
+            classifier = pipeline(
+                "zero-shot-classification", 
+                model=self.model_name
+            )
+            
+            # Define possible root cause categories
+            candidate_labels = [
+                "authentication issue", 
+                "network connectivity", 
+                "software bug", 
+                "hardware failure",
+                "configuration error", 
+                "permission issue", 
+                "performance degradation",
+                "data corruption", 
+                "security incident", 
+                "user error"
+            ]
+            
+            # Classify the text
+            result = classifier(text, candidate_labels)
+            
+            # Return the top category
+            return result['labels'][0]
+        except Exception as e:
+            print(f"Error in zero-shot classification: {e}")
+            return None
     
     def visualize_similarity(self, similarity_results, pca_results):
         """
@@ -503,13 +828,92 @@ class TicketAnalyzer:
             print(f"Saved cluster distribution chart to {output_file}")
             plt.close()
     
-    def generate_report(self, df, root_cause_summary):
+    def visualize_topics(self, topic_results, df):
+        """
+        Visualize topic modeling results.
+        
+        Args:
+            topic_results (dict): Dictionary with topic modeling results
+            df (pandas.DataFrame): Original DataFrame with ticket data
+        """
+        # Create output directory
+        output_dir = "ticket_analysis_visualizations/topics"
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Plot topic distribution by assignment group
+        for group, results in topic_results.items():
+            # Create a safe filename
+            safe_group = re.sub(r'[^\w\-_]', '_', str(group))
+            group_dir = os.path.join(output_dir, safe_group)
+            os.makedirs(group_dir, exist_ok=True)
+            
+            # Get topic assignments
+            topic_df = results['topic_assignments']
+            
+            # Count tickets per topic
+            topic_counts = topic_df['topic_id'].value_counts().sort_index()
+            
+            # Get topic names
+            topic_names = [f"T{topic_id}: {info['name']}" for topic_id, info in results['topics'].items()]
+            
+            # Create bar chart of tickets per topic
+            plt.figure(figsize=(12, 6))
+            bars = plt.bar(range(len(topic_counts)), topic_counts.values)
+            
+            # Add topic names as labels
+            plt.xticks(
+                range(len(topic_counts)),
+                [topic_names[i] if i < len(topic_names) else f"T{i}" for i in topic_counts.index],
+                rotation=45,
+                ha='right'
+            )
+            
+            plt.title(f'Topic Distribution for {group}')
+            plt.xlabel('Topics')
+            plt.ylabel('Number of Tickets')
+            plt.tight_layout()
+            
+            # Save plot
+            output_file = os.path.join(group_dir, 'topic_distribution.png')
+            plt.savefig(output_file)
+            print(f"Saved topic distribution chart to {output_file}")
+            plt.close()
+            
+            # Generate and save word clouds for each topic (if not already generated)
+            for topic_id, topic_info in results['topics'].items():
+                wordcloud_file = os.path.join(group_dir, f'topic_{topic_id}_wordcloud.png')
+                if not os.path.exists(wordcloud_file):
+                    # Create a dictionary of word: weight
+                    word_weights = {word: weight for word, weight in topic_info['words']}
+                    
+                    # Generate the word cloud
+                    wc = WordCloud(
+                        background_color='white',
+                        max_words=100,
+                        width=800,
+                        height=400,
+                        contour_width=3,
+                        contour_color='steelblue'
+                    ).generate_from_frequencies(word_weights)
+                    
+                    # Plot and save
+                    plt.figure(figsize=(10, 6))
+                    plt.imshow(wc, interpolation='bilinear')
+                    plt.axis('off')
+                    plt.title(f"Topic {topic_id}: {topic_info['name']}")
+                    plt.tight_layout()
+                    plt.savefig(wordcloud_file)
+                    plt.close()
+                    print(f"Saved word cloud to {wordcloud_file}")
+    
+    def generate_report(self, df, root_cause_summary, topic_results=None):
         """
         Generate a summary report of the analysis.
         
         Args:
             df (pandas.DataFrame): DataFrame with analysis results
             root_cause_summary (dict): Summary of root causes
+            topic_results (dict, optional): Results from topic modeling
             
         Returns:
             str: Summary report text
@@ -531,6 +935,32 @@ class TicketAnalyzer:
         for code, count in df['resolution_code'].value_counts().head(5).items():
             report.append(f"- {code}: {count} tickets")
         
+        # Include topic modeling results if available
+        if topic_results:
+            report.append("\n## Topic Modeling Results")
+            for group, results in topic_results.items():
+                report.append(f"\n### Assignment Group: {group}")
+                report.append(f"- Total Tickets: {results['topic_assignments'].shape[0]}")
+                report.append(f"- Optimal Number of Topics: {results['optimal_num_topics']}")
+                report.append(f"- Coherence Score: {results['coherence_score']:.4f}")
+                
+                report.append("\n#### Identified Topics:")
+                for topic_id, topic_info in results['topics'].items():
+                    # Get count of tickets in this topic
+                    topic_count = results['topic_assignments'][results['topic_assignments']['topic_id'] == topic_id].shape[0]
+                    percentage = 100 * topic_count / results['topic_assignments'].shape[0]
+                    
+                    report.append(f"\n##### Topic {topic_id}: {topic_info['name']}")
+                    report.append(f"- Tickets: {topic_count} ({percentage:.1f}%)")
+                    report.append(f"- Key Terms: {', '.join([word for word, _ in topic_info['words'][:7]])}")
+                    
+                    # Add example tickets
+                    example_tickets = results['topic_assignments'][results['topic_assignments']['topic_id'] == topic_id]['incident_number'].head(3).tolist()
+                    if example_tickets:
+                        report.append(f"- Example Tickets: {', '.join(example_tickets)}")
+                
+                report.append(f"\n[LDA Visualization for {group}](ticket_analysis_visualizations/topics_{group.replace(' ', '_')}/ldavis.html)")
+        
         report.append("\n## Root Cause Analysis")
         for group_key, summary in sorted(
             root_cause_summary.items(),
@@ -544,12 +974,14 @@ class TicketAnalyzer:
             
             for cluster_name, info in summary['root_causes'].items():
                 report.append(f"\n#### {cluster_name} ({info['count']} tickets)")
+                if 'identified_root_cause' in info:
+                    report.append(f"- Identified Root Cause: {info['identified_root_cause']}")
                 report.append(f"- Key Terms: {', '.join(info['top_terms'])}")
                 report.append(f"- Sample Tickets: {', '.join(info['sample_tickets'])}")
         
         return "\n".join(report)
     
-    def run_analysis(self, app_id, start_date, end_date):
+    def run_analysis(self, app_id, start_date, end_date, perform_topic_modeling=True, min_tickets_for_topics=100):
         """
         Run the complete ticket analysis pipeline.
         
@@ -557,35 +989,47 @@ class TicketAnalyzer:
             app_id (str): Application ID to filter tickets
             start_date (str): Start date in format 'YYYY-MM-DD'
             end_date (str): End date in format 'YYYY-MM-DD'
+            perform_topic_modeling (bool): Whether to perform topic modeling
+            min_tickets_for_topics (int): Minimum number of tickets required for topic modeling
             
         Returns:
             pandas.DataFrame: DataFrame with analysis results
             str: Summary report
+            dict: Topic modeling results (if performed)
         """
         # Step 1: Fetch ticket data
         print(f"Fetching tickets for app_id={app_id} from {start_date} to {end_date}...")
         df = self.fetch_tickets(app_id, start_date, end_date)
         if df is None or len(df) == 0:
-            return None, "No tickets found matching the criteria."
+            return None, "No tickets found matching the criteria.", None
         
         # Step 2: Perform similarity analysis
         print("\nPerforming ticket similarity analysis...")
         similarity_results, pca_results = self.perform_similarity_analysis(df)
         
-        # Step 3: Classify root causes
+        # Step 3: Perform topic modeling (if requested)
+        topic_results = None
+        if perform_topic_modeling:
+            print("\nPerforming topic modeling for large assignment groups...")
+            topic_results = self.perform_topic_modeling(df, min_tickets=min_tickets_for_topics)
+        
+        # Step 4: Classify root causes
         print("\nClassifying tickets to identify root causes...")
         df_with_clusters, root_cause_summary = self.classify_root_causes(df)
         
-        # Step 4: Visualize results
+        # Step 5: Visualize results
         print("\nGenerating visualizations...")
         self.visualize_similarity(similarity_results, pca_results)
         self.visualize_root_causes(df_with_clusters, root_cause_summary)
         
-        # Step 5: Generate report
-        print("\nGenerating summary report...")
-        report = self.generate_report(df_with_clusters, root_cause_summary)
+        if topic_results:
+            self.visualize_topics(topic_results, df_with_clusters)
         
-        return df_with_clusters, report
+        # Step 6: Generate report
+        print("\nGenerating summary report...")
+        report = self.generate_report(df_with_clusters, root_cause_summary, topic_results)
+        
+        return df_with_clusters, report, topic_results
 
 
 # Example usage
@@ -599,24 +1043,37 @@ if __name__ == "__main__":
         'port': 5432
     }
     
-    # Path to locally saved BERT model
-    local_model_path = "./bert_model_cache"  # Update this to your local model path
+    # Path to locally saved transformer model
+    local_model_path = "./transformer_model_cache"  # Update this to your local model path
     
-    # Initialize the analyzer with local model path
-    analyzer = TicketAnalyzer(db_config, model_path=local_model_path)
+    # Choose transformer model
+    model_name = "roberta-base"  # More sophisticated model: roberta-base or roberta-large
+    
+    # Initialize the analyzer with local model path or model name
+    analyzer = TicketAnalyzer(
+        db_config, 
+        model_path=local_model_path,  # Use this if you have a local model
+        # model_name=model_name  # Use this if downloading from Hugging Face
+    )
     
     # Run analysis
     app_id = "APP123"  # Replace with actual app_id
     start_date = "2023-01-01"
     end_date = "2023-12-31"
     
-    results_df, report = analyzer.run_analysis(app_id, start_date, end_date)
+    results_df, report, topic_results = analyzer.run_analysis(
+        app_id, 
+        start_date, 
+        end_date,
+        perform_topic_modeling=True,
+        min_tickets_for_topics=100  # Only analyze groups with 100+ tickets
+    )
     
     # Save results to CSV
     if results_df is not None:
         results_df.to_csv(f"ticket_analysis_{app_id}_{start_date}_to_{end_date}.csv", index=False)
         
-    # Save report to text file
+    # Save report to markdown file
     with open(f"ticket_analysis_report_{app_id}_{start_date}_to_{end_date}.md", "w") as f:
         f.write(report)
         
