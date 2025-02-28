@@ -20,6 +20,7 @@ from transformers import AutoTokenizer, AutoModel
 import torch
 from collections import Counter
 import warnings
+import os
 warnings.filterwarnings('ignore')
 
 # Download required NLTK resources
@@ -34,17 +35,30 @@ class TicketAnalyzer:
     Performs ticket similarity analysis and root cause classification.
     """
     
-    def __init__(self, db_config):
+    def __init__(self, db_config, model_path=None):
         """
-        Initialize with database configuration.
+        Initialize with database configuration and optional local model path.
         
         Args:
             db_config (dict): Database configuration parameters
+            model_path (str, optional): Path to locally saved BERT model
         """
         self.db_config = db_config
-        # Initialize BERT model and tokenizer
-        self.tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
-        self.model = AutoModel.from_pretrained('bert-base-uncased')
+        # Initialize BERT model and tokenizer from local path if provided
+        if model_path:
+            print(f"Loading BERT model from local path: {model_path}")
+            self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+            self.model = AutoModel.from_pretrained(model_path)
+        else:
+            # Try to download from Hugging Face (may fail behind VPN)
+            try:
+                self.tokenizer = AutoTokenizer.from_pretrained('bert-base-uncased')
+                self.model = AutoModel.from_pretrained('bert-base-uncased')
+            except Exception as e:
+                print(f"Error downloading BERT model: {e}")
+                print("Please provide a local model path using the model_path parameter.")
+                raise
+        
         self.lemmatizer = WordNetLemmatizer()
         self.stop_words = set(stopwords.words('english'))
         
@@ -372,8 +386,18 @@ class TicketAnalyzer:
             similarity_results (dict): Dictionary with similarity matrices
             pca_results (dict): Dictionary with PCA results
         """
+        # Create output directory if it doesn't exist
+        output_dir = "ticket_analysis_visualizations"
+        os.makedirs(output_dir, exist_ok=True)
+        
         # Create visualizations for each resolution code
         for code in similarity_results:
+            # Create code-specific directory for visualizations
+            # Replace any characters that might be invalid in filenames
+            safe_code = re.sub(r'[^\w\-_]', '_', str(code))
+            code_dir = os.path.join(output_dir, safe_code)
+            os.makedirs(code_dir, exist_ok=True)
+            
             # Plot similarity heatmap
             plt.figure(figsize=(10, 8))
             sns.heatmap(
@@ -384,7 +408,9 @@ class TicketAnalyzer:
             )
             plt.title(f'Ticket Similarity Matrix - Resolution Code: {code}')
             plt.tight_layout()
-            plt.savefig(f'similarity_heatmap_{code}.png')
+            output_file = os.path.join(code_dir, 'similarity_heatmap.png')
+            plt.savefig(output_file)
+            print(f"Saved heatmap to {output_file}")
             plt.close()
             
             # Plot PCA scatter plot if available
@@ -409,7 +435,9 @@ class TicketAnalyzer:
                 plt.xlabel('PCA Component 1')
                 plt.ylabel('PCA Component 2')
                 plt.tight_layout()
-                plt.savefig(f'similarity_pca_{code}.png')
+                output_file = os.path.join(code_dir, 'similarity_pca.png')
+                plt.savefig(output_file)
+                print(f"Saved PCA plot to {output_file}")
                 plt.close()
     
     def visualize_root_causes(self, df, root_cause_summary):
@@ -420,6 +448,10 @@ class TicketAnalyzer:
             df (pandas.DataFrame): DataFrame with cluster labels
             root_cause_summary (dict): Summary of root causes by group
         """
+        # Create output directory if it doesn't exist
+        output_dir = "ticket_analysis_visualizations"
+        os.makedirs(output_dir, exist_ok=True)
+        
         # 1. Create bar chart of ticket counts by assignment group
         plt.figure(figsize=(12, 6))
         group_counts = df['assignment_group'].value_counts().head(10)
@@ -427,7 +459,9 @@ class TicketAnalyzer:
         plt.title('Top 10 Assignment Groups by Ticket Count')
         plt.xticks(rotation=45, ha='right')
         plt.tight_layout()
-        plt.savefig('top_assignment_groups.png')
+        output_file = os.path.join(output_dir, 'top_assignment_groups.png')
+        plt.savefig(output_file)
+        print(f"Saved assignment groups chart to {output_file}")
         plt.close()
         
         # 2. Create bar chart of ticket counts by resolution code
@@ -437,7 +471,9 @@ class TicketAnalyzer:
         plt.title('Top 10 Resolution Codes by Ticket Count')
         plt.xticks(rotation=45, ha='right')
         plt.tight_layout()
-        plt.savefig('top_resolution_codes.png')
+        output_file = os.path.join(output_dir, 'top_resolution_codes.png')
+        plt.savefig(output_file)
+        print(f"Saved resolution codes chart to {output_file}")
         plt.close()
         
         # 3. Visualize cluster distribution for top groups
@@ -448,6 +484,11 @@ class TicketAnalyzer:
         )[:5]
         
         for group_key, summary in top_groups:
+            # Create a safe filename by replacing invalid characters
+            safe_group_key = re.sub(r'[^\w\-_]', '_', str(group_key))
+            group_dir = os.path.join(output_dir, safe_group_key)
+            os.makedirs(group_dir, exist_ok=True)
+            
             root_causes = summary['root_causes']
             cluster_names = list(root_causes.keys())
             cluster_counts = [info['count'] for info in root_causes.values()]
@@ -457,7 +498,9 @@ class TicketAnalyzer:
             plt.title(f'Cluster Distribution for {group_key}')
             plt.xticks(rotation=45, ha='right')
             plt.tight_layout()
-            plt.savefig(f'cluster_distribution_{group_key}.png')
+            output_file = os.path.join(group_dir, 'cluster_distribution.png')
+            plt.savefig(output_file)
+            print(f"Saved cluster distribution chart to {output_file}")
             plt.close()
     
     def generate_report(self, df, root_cause_summary):
@@ -556,8 +599,11 @@ if __name__ == "__main__":
         'port': 5432
     }
     
-    # Initialize the analyzer
-    analyzer = TicketAnalyzer(db_config)
+    # Path to locally saved BERT model
+    local_model_path = "./bert_model_cache"  # Update this to your local model path
+    
+    # Initialize the analyzer with local model path
+    analyzer = TicketAnalyzer(db_config, model_path=local_model_path)
     
     # Run analysis
     app_id = "APP123"  # Replace with actual app_id
