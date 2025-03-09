@@ -1,197 +1,170 @@
-// Excel Processor for extracting groups and notes data
-import * as XLSX from 'xlsx';
+import pandas as pd
+import os
+import re
+import glob
 
-// Main function to process the Excel file
-async function processExcelAndSave() {
-  try {
-    // List available files to find the Excel file
-    const files = await window.fs.readdir('.');
-    console.log('Available files:', files);
+def process_excel_file(input_filepath, output_filepath='system_gen.xlsx'):
+    """
+    Process an Excel file to extract specific groups and information from notes
     
-    // Filter for Excel files
-    const excelFiles = files.filter(file => 
-      file.endsWith('.xlsx') || file.endsWith('.xls')
-    );
+    Args:
+        input_filepath: Path to the input Excel file
+        output_filepath: Path where the output Excel file will be saved
+        
+    Returns:
+        str: Status message
+    """
+    try:
+        # Read the Excel file
+        print(f"Reading Excel file: {input_filepath}")
+        df = pd.read_excel(input_filepath)
+        
+        # Ensure column names are lowercase for consistent access
+        df.columns = [col.lower() for col in df.columns]
+        
+        # Filter only specified groups
+        target_groups = ['group_a', 'group_b', 'group_c', 'group_d']
+        filtered_df = df[df['group'].isin(target_groups)].copy()
+        
+        if filtered_df.empty:
+            return "No matching groups found in the data."
+        
+        # Extract information from notes column
+        filtered_df['Flow'] = filtered_df['notes'].apply(extract_flow)
+        filtered_df['Issue'] = filtered_df['notes'].apply(lambda x: extract_between(x, 'Issue:', ['RCA:', 'RCA :', 'Resolution:', 'Resolution :']))
+        filtered_df['Resolution'] = filtered_df['notes'].apply(extract_resolution)
+        filtered_df['RCA'] = filtered_df['notes'].apply(extract_rca)
+        
+        # Save the result to a new Excel file
+        filtered_df.to_excel(output_filepath, index=False)
+        print(f"Successfully saved: {output_filepath}")
+        
+        return f"Processing complete! Output saved as {output_filepath}"
     
-    if (excelFiles.length === 0) {
-      console.error('No Excel files found. Please upload an Excel file.');
-      return;
-    }
-    
-    // Use the first Excel file found (you can modify this to use a specific filename)
-    const inputFileName = excelFiles[0];
-    console.log(`Processing file: ${inputFileName}`);
-    
-    // Read the file content
-    const fileContent = await window.fs.readFile(inputFileName);
-    
-    // Process the Excel file
-    const outputWorkbook = processExcelFile(fileContent);
-    
-    // Convert the workbook to a binary blob
-    const outputData = XLSX.write(outputWorkbook, { bookType: 'xlsx', type: 'array' });
-    
-    // Save the processed file
-    await window.fs.writeFile('system_gen.xlsx', new Uint8Array(outputData));
-    console.log('Successfully saved system_gen.xlsx');
-    
-    return 'Processing complete! Output saved as system_gen.xlsx';
-  } catch (error) {
-    console.error('Error processing Excel file:', error);
-    return `Error: ${error.message}`;
-  }
-}
+    except Exception as e:
+        return f"Error processing Excel file: {str(e)}"
 
-// Function to process the Excel file content
-function processExcelFile(fileContent) {
-  // Read the workbook
-  const workbook = XLSX.read(fileContent, {
-    cellStyles: true,
-    cellFormulas: true,
-    cellDates: true,
-    cellNF: true,
-    sheetStubs: true
-  });
-  
-  // Get the first sheet
-  const firstSheetName = workbook.SheetNames[0];
-  const worksheet = workbook.Sheets[firstSheetName];
-  
-  // Convert to array of arrays
-  const data = XLSX.utils.sheet_to_json(worksheet, { header: 1 });
-  
-  // Process the data
-  const processedData = processData(data);
-  
-  // Create a new worksheet with the processed data
-  const outputWs = XLSX.utils.aoa_to_sheet(processedData);
-  const outputWb = XLSX.utils.book_new();
-  XLSX.utils.book_append_sheet(outputWb, outputWs, 'Processed');
-  
-  // Return the workbook for saving
-  return outputWb;
-}
+def extract_flow(notes):
+    """Extract the Flow information from the first line of notes"""
+    if not isinstance(notes, str):
+        return 'NA'
+    
+    lines = notes.split('\n')
+    if not lines or not lines[0].startswith('|Flow|'):
+        return 'NA'
+    
+    flow_match = re.search(r'\|Flow\|(.*?)\|', lines[0])
+    if flow_match:
+        return flow_match.group(1).strip()
+    return 'NA'
 
-// Function to process the data according to requirements
-function processData(data) {
-  // Extract headers and rows
-  const headers = data[0];
-  const rows = data.slice(1);
-  
-  // Find column indices based on headers
-  let numberIdx = headers.findIndex(h => h?.toLowerCase() === 'number');
-  let groupIdx = headers.findIndex(h => h?.toLowerCase() === 'group');
-  let codeIdx = headers.findIndex(h => h?.toLowerCase() === 'code');
-  let notesIdx = headers.findIndex(h => h?.toLowerCase() === 'notes');
-  
-  // If headers aren't found, use default positions
-  numberIdx = numberIdx !== -1 ? numberIdx : 0;
-  groupIdx = groupIdx !== -1 ? groupIdx : 1;
-  codeIdx = codeIdx !== -1 ? codeIdx : 2;
-  notesIdx = notesIdx !== -1 ? notesIdx : 3;
-  
-  // Create new headers for the output file
-  const newHeaders = ['number', 'group', 'code', 'notes', 'Flow', 'Issue', 'Resolution', 'RCA'];
-  
-  // Function to extract text between two patterns
-  function extractBetween(text, startPattern, endPatterns) {
-    if (!text) return 'NA';
+def extract_between(text, start_pattern, end_patterns):
+    """
+    Extract text between a start pattern and the earliest of several possible end patterns
     
-    const startIdx = text.indexOf(startPattern);
-    if (startIdx === -1) return 'NA';
-    
-    const contentStart = startIdx + startPattern.length;
-    let contentEnd = text.length;
-    
-    // Find the earliest occurrence of any end pattern
-    for (const endPattern of endPatterns) {
-      const endIdx = text.indexOf(endPattern, contentStart);
-      if (endIdx !== -1 && endIdx < contentEnd) {
-        contentEnd = endIdx;
-      }
-    }
-    
-    return text.substring(contentStart, contentEnd).trim();
-  }
-  
-  // Process each row to extract the required information
-  const processedRows = rows
-    // Filter only the specified groups
-    .filter(row => {
-      const group = row[groupIdx];
-      return ['group_a', 'group_b', 'group_c', 'group_d'].includes(group);
-    })
-    .map(row => {
-      const number = row[numberIdx];
-      const group = row[groupIdx];
-      const code = row[codeIdx];
-      const notes = row[notesIdx] || '';
-      
-      // Initialize new columns with default 'NA'
-      let flow = 'NA';
-      let issue = 'NA';
-      let resolution = 'NA';
-      let rca = 'NA';
-      
-      if (notes) {
-        // Convert notes to string if it's not already
-        const notesStr = String(notes);
+    Args:
+        text: The text to search in
+        start_pattern: The pattern marking the start of the desired text
+        end_patterns: List of patterns that could mark the end of the desired text
         
-        // Extract Flow from first line if it matches the pattern |Flow|sometext-sometext|
-        const lines = notesStr.split('\n');
-        if (lines[0] && lines[0].includes('|Flow|')) {
-          const flowMatch = lines[0].match(/\|Flow\|(.*?)\|/);
-          if (flowMatch && flowMatch[1]) {
-            flow = flowMatch[1].trim();
-          }
-        }
-        
-        // Extract Issue - look for "Issue:" and extract until "RCA:" or "Resolution:"
-        issue = extractBetween(
-          notesStr, 
-          'Issue:', 
-          ['RCA:', 'RCA :', 'Resolution:', 'Resolution :']
-        );
-        
-        // Extract Resolution
-        resolution = extractBetween(
-          notesStr, 
-          'Resolution:', 
-          ['RCA:', 'RCA :', 'Issue:', 'Issue :']
-        );
-        if (resolution === 'NA') {
-          resolution = extractBetween(
-            notesStr, 
+    Returns:
+        str: Extracted text or 'NA' if not found
+    """
+    if not isinstance(text, str):
+        return 'NA'
+    
+    start_idx = text.find(start_pattern)
+    if start_idx == -1:
+        return 'NA'
+    
+    content_start = start_idx + len(start_pattern)
+    content_end = len(text)
+    
+    # Find the earliest occurrence of any end pattern
+    for end_pattern in end_patterns:
+        end_idx = text.find(end_pattern, content_start)
+        if end_idx != -1 and end_idx < content_end:
+            content_end = end_idx
+    
+    return text[content_start:content_end].strip()
+
+def extract_resolution(notes):
+    """Extract Resolution information with handling for space variations"""
+    if not isinstance(notes, str):
+        return 'NA'
+    
+    resolution = extract_between(
+        notes, 
+        'Resolution:', 
+        ['RCA:', 'RCA :', 'Issue:', 'Issue :']
+    )
+    
+    if resolution == 'NA':
+        resolution = extract_between(
+            notes, 
             'Resolution :', 
             ['RCA:', 'RCA :', 'Issue:', 'Issue :']
-          );
-        }
-        
-        // Extract RCA
-        rca = extractBetween(
-          notesStr, 
-          'RCA:', 
-          ['Resolution:', 'Resolution :', 'Issue:', 'Issue :']
-        );
-        if (rca === 'NA') {
-          rca = extractBetween(
-            notesStr, 
+        )
+    
+    return resolution
+
+def extract_rca(notes):
+    """Extract RCA information with handling for space variations"""
+    if not isinstance(notes, str):
+        return 'NA'
+    
+    rca = extract_between(
+        notes, 
+        'RCA:', 
+        ['Resolution:', 'Resolution :', 'Issue:', 'Issue :']
+    )
+    
+    if rca == 'NA':
+        rca = extract_between(
+            notes, 
             'RCA :', 
             ['Resolution:', 'Resolution :', 'Issue:', 'Issue :']
-          );
-        }
-      }
-      
-      return [number, group, code, notes, flow, issue, resolution, rca];
-    });
-  
-  // Combine headers and processed rows
-  return [newHeaders, ...processedRows];
-}
+        )
+    
+    return rca
 
-// Run the main function
-processExcelAndSave().then(result => {
-  console.log(result);
-}).catch(error => {
-  console.error('Error:', error);
-});
+def find_excel_files(directory='.'):
+    """Find all Excel files in the specified directory"""
+    excel_patterns = ['*.xlsx', '*.xls']
+    excel_files = []
+    
+    for pattern in excel_patterns:
+        excel_files.extend(glob.glob(os.path.join(directory, pattern)))
+    
+    return excel_files
+
+def main():
+    """Main function to find and process Excel files"""
+    # Find all Excel files in the current directory
+    excel_files = find_excel_files()
+    
+    if not excel_files:
+        print("No Excel files found. Please ensure your Excel file is in the current directory.")
+        return
+    
+    print(f"Found {len(excel_files)} Excel file(s):")
+    for i, file in enumerate(excel_files, 1):
+        print(f"{i}. {os.path.basename(file)}")
+    
+    # Use the first file by default, or let the user choose
+    if len(excel_files) == 1:
+        input_file = excel_files[0]
+    else:
+        try:
+            choice = int(input(f"Enter the number of the file to process (1-{len(excel_files)}): "))
+            input_file = excel_files[choice - 1]
+        except (ValueError, IndexError):
+            print("Invalid choice. Using the first file.")
+            input_file = excel_files[0]
+    
+    # Process the selected file
+    result = process_excel_file(input_file)
+    print(result)
+
+if __name__ == "__main__":
+    main()
